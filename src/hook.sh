@@ -3,8 +3,10 @@
 #
 #  * the first interactive shell of a terminal re-runs itself inside `script`, so the whole
 #    terminal (commands + output) is recorded to <session>/terminals/<id>.typescript
-#  * the shell running inside `script` logs every command with time, user, cwd and exit
-#    code to <session>/commands.log
+#  * the shell running inside `script` marks where every command's output starts and ends
+#    in that recording (<id>.idx), so ctf-logger can cut it into clean per-command blocks
+#  * every command is also logged with time, user, cwd and exit code to commands.log
+#  * SSLKEYLOGFILE is exported, so browsers/curl started from the terminal log TLS keys
 
 case $- in *i*) ;; *) return 0 ;; esac
 __ctf_marker='{{MARKER}}'
@@ -17,7 +19,7 @@ if [ -z "${CTF_LOGGER_SESSION:-}" ] && [ -r "$__ctf_marker" ]; then
         __ctf_id="$(date +%Y%m%d_%H%M%S)_$(id -un)_$$"
         __ctf_ts="$__ctf_dir/terminals/$__ctf_id.typescript"
         printf '\033[1;31m[CTF-Logger]\033[0m recording this terminal -> %s\n' "$__ctf_ts"
-        CTF_LOGGER_SESSION="$__ctf_dir" CTF_LOGGER_TERM_ID="$__ctf_id" \
+        CTF_LOGGER_SESSION="$__ctf_dir" CTF_LOGGER_TERM_ID="$__ctf_id" CTF_LOGGER_TS="$__ctf_ts" \
             script -q -f --log-timing "$__ctf_dir/terminals/$__ctf_id.timing" "$__ctf_ts"
         __ctf_rc=$?
         # Only close this shell if the recording really ran; otherwise fall through to a
@@ -29,38 +31,72 @@ fi
 if [ -n "${CTF_LOGGER_SESSION:-}" ] && [ -w "$CTF_LOGGER_SESSION/commands.log" ]; then
     __ctf_host="$(uname -n)"
     __ctf_user="$(id -un)"
+    __ctf_idx="$CTF_LOGGER_SESSION/terminals/${CTF_LOGGER_TERM_ID:-unknown}.idx"
+    export SSLKEYLOGFILE="$CTF_LOGGER_SESSION/browser/tls_keys.log"
 
-    __ctf_log() { # $1 = exit code, $2 = command line
-        local cmd="${2//$'\n'/ ; }"
+    __ctf_now() { date +%s.%3N; }
+    __ctf_flat() { local s="${1//$'\t'/ }"; printf '%s' "${s//$'\n'/ ; }"; }
+
+    # Size of the recording once `script` has caught up with what the shell printed.
+    __ctf_size() {
+        local a b i=0
+        b="$(stat -c %s "${CTF_LOGGER_TS:-/nonexistent}" 2>/dev/null || echo 0)"
+        while [ $i -lt 10 ]; do
+            sleep 0.02
+            a="$b"
+            b="$(stat -c %s "${CTF_LOGGER_TS:-/nonexistent}" 2>/dev/null || echo 0)"
+            [ "$a" = "$b" ] && break
+            i=$((i + 1))
+        done
+        printf '%s' "$b"
+    }
+
+    __ctf_start() { # $1 = command line
+        printf 'S\t%s\t%s\t%s@%s\t%s\t%s\n' "$(__ctf_now)" "$(__ctf_size)" "$__ctf_user" \
+            "$__ctf_host" "$(__ctf_flat "$PWD")" "$(__ctf_flat "$1")" >> "$__ctf_idx"
+    }
+
+    __ctf_end() { # $1 = exit code, $2 = command line
+        printf 'E\t%s\t%s\t%s\n' "$(__ctf_now)" "$(__ctf_size)" "$1" >> "$__ctf_idx"
         printf '%s\t%s@%s\t%s\t%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
-            "$__ctf_user" "$__ctf_host" "${CTF_LOGGER_TERM_ID:-unknown}" "$PWD" "$1" "$cmd" \
-            >> "$CTF_LOGGER_SESSION/commands.log"
+            "$__ctf_user" "$__ctf_host" "${CTF_LOGGER_TERM_ID:-unknown}" "$PWD" "$1" \
+            "$(__ctf_flat "$2")" >> "$CTF_LOGGER_SESSION/commands.log"
     }
 
     if [ -n "${BASH_VERSION:-}" ]; then
         HISTCONTROL=  # record repeated and space-prefixed commands too
-        __ctf_bash_hook() {
-            local ec=$? line num cmd
+
+        # Sets __ctf_num / __ctf_line from the newest history entry.
+        __ctf_hist() {
+            local line
             line="$(HISTTIMEFORMAT= builtin history 1)"
             line="${line#"${line%%[! ]*}"}"   # "  42  ls -la" -> "42  ls -la"
-            num="${line%%[!0-9]*}"
-            cmd="${line#"$num"}"; cmd="${cmd#\*}"; cmd="${cmd#"${cmd%%[! ]*}"}"
-            if [ -n "$num" ] && [ "$num" != "${__ctf_last:-}" ]; then
+            __ctf_num="${line%%[!0-9]*}"
+            line="${line#"$__ctf_num"}"; line="${line#\*}"
+            __ctf_line="${line#"${line%%[! ]*}"}"
+        }
+        # PS0 is expanded right before a command runs (in a subshell: it only writes).
+        __ctf_bash_pre() { __ctf_hist; [ -n "$__ctf_num" ] && __ctf_start "$__ctf_line"; }
+        __ctf_bash_post() {
+            local ec=$?
+            __ctf_hist
+            if [ -n "$__ctf_num" ] && [ "$__ctf_num" != "${__ctf_last:-}" ]; then
                 # the first prompt only shows the last command of a previous session
-                [ -n "${__ctf_last:-}" ] && __ctf_log "$ec" "$cmd"
-                __ctf_last="$num"
+                [ -n "${__ctf_last:-}" ] && __ctf_end "$ec" "$__ctf_line"
+                __ctf_last="$__ctf_num"
             fi
             [ -z "${__ctf_last:-}" ] && __ctf_last=0
             return $ec
         }
-        PROMPT_COMMAND="__ctf_bash_hook${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+        PS0='$(__ctf_bash_pre)'"${PS0:-}"
+        PROMPT_COMMAND="__ctf_bash_post${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
     elif [ -n "${ZSH_VERSION:-}" ]; then
         autoload -Uz add-zsh-hook
-        __ctf_preexec() { __ctf_cmd="$1"; }
+        __ctf_preexec() { __ctf_cmd="$1"; __ctf_start "$1"; }
         __ctf_precmd() {
             local ec=$?
             if [ -n "${__ctf_cmd+x}" ]; then
-                __ctf_log "$ec" "$__ctf_cmd"
+                __ctf_end "$ec" "$__ctf_cmd"
                 unset __ctf_cmd
             fi
         }

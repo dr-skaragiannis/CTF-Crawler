@@ -1,16 +1,24 @@
 //! ctf-logger - attacker-side (Kali) recorder for a CTF challenge.
 //!
 //! While running it stores, live, under /home/<user>/CTF-Logs/<challenge>/<timestamp>/:
-//!   pcap/<iface>.pcap        one tcpdump per network interface (new ones such as tun0 are
-//!                            picked up automatically, restarted ones get .partN files)
-//!   pcap/target_<ip>.pcap    all traffic to/from the target IP on any interface
-//!   terminals/*.typescript   full recording (input + output) of every terminal opened
-//!   terminals/*.txt          the same, cleaned of escape codes (written on stop)
-//!   commands.log             every command: time, user@host, terminal, cwd, exit code
+//!   pcap/<iface>.pcap          one tcpdump per network interface (new ones such as tun0 are
+//!                              picked up automatically, restarted ones get .partN files)
+//!   pcap/target_<ip>.pcap      all traffic to/from the target IP on any interface
+//!   terminal_output.log        every command of every terminal with its own output,
+//!                              time, user, cwd, exit code and duration (chronological)
+//!   terminals/<id>.log         the same, per terminal
+//!   terminals/<id>.txt         whole terminal, cleaned of escape codes
+//!   terminals/<id>.typescript  raw recording (+ .timing for scriptreplay, .idx offsets)
+//!   commands.log               one line per command
+//!   browser/tls_keys.log       TLS keys of Firefox/Chrome (decrypt HTTPS in Wireshark)
+//!   browser/history.tsv        pages visited and files downloaded during the session
+//!   burp/burp_http.log         every Burp request/response (with the Burp extension)
 //!   session_info.txt / events.log
 //!
 //! Usage:  sudo ctf-logger              start a session (asks challenge name + target IP)
-//!         sudo ctf-logger --uninstall  remove the shell hooks from the rc files
+//!         sudo ctf-logger --uninstall  remove the shell hooks and browser launchers
+
+mod transcript;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -22,7 +30,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ctf_logger::{
     chown_recursive, dir_size, human_size, invoking_user, is_root, log_root, now_human, prompt,
@@ -31,12 +39,30 @@ use ctf_logger::{
 
 const HOOK_DIR: &str = "/etc/ctf-logger";
 const HOOK_PATH: &str = "/etc/ctf-logger/hook.sh";
+const WRAP_PATH: &str = "/etc/ctf-logger/browser-wrap.sh";
+const HISTORY_PATH: &str = "/etc/ctf-logger/browser_history.py";
+const BURP_PATH: &str = "/etc/ctf-logger/ctf_burp_logger.py";
 const HOOK_TEMPLATE: &str = include_str!("hook.sh");
+const WRAP_TEMPLATE: &str = include_str!("browser-wrap.sh");
+const HISTORY_SCRIPT: &str = include_str!("browser_history.py");
+const BURP_TEMPLATE: &str = include_str!("../burp/ctf_burp_logger.py");
 const RC_MARK: &str = "# CTF-LOGGER hook";
 const RC_FILES: [&str; 2] = [".bashrc", ".zshrc"];
+const DESKTOP_MARK: &str = "X-CTF-Logger-Override=true";
+/// Browser launchers that get an override sending them through browser-wrap.sh.
+const BROWSER_DESKTOP_FILES: [&str; 6] = [
+    "firefox-esr.desktop",
+    "firefox.desktop",
+    "google-chrome.desktop",
+    "chromium.desktop",
+    "chromium-browser.desktop",
+    "brave-browser.desktop",
+];
 /// Give up on an interface after this many tcpdump crashes in a row.
 const MAX_FAILS: u32 = 5;
 const STATUS_EVERY: Duration = Duration::from_secs(30);
+const RENDER_EVERY: Duration = Duration::from_secs(5);
+const HISTORY_EVERY: Duration = Duration::from_secs(60);
 
 struct Capture {
     iface: String,
@@ -103,7 +129,7 @@ fn run() -> io::Result<()> {
     let root = log_root(&user);
 
     if std::env::args().nth(1).as_deref() == Some("--uninstall") {
-        return uninstall_hooks(&user);
+        return uninstall(&user);
     }
     for bin in ["tcpdump", "script"] {
         if !which(bin) {
@@ -114,17 +140,23 @@ fn run() -> io::Result<()> {
     println!("=== CTF-Logger ===  logs go to {}\n", root.display());
     let challenge = sanitize(&prompt("Challenge name", None)?);
     let target = prompt_ip("Target (victim) IP address", None)?;
+    let started_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
 
     let session = root.join(&challenge).join(timestamp());
     let pcap_dir = session.join("pcap");
     let term_dir = session.join("terminals");
-    fs::create_dir_all(&pcap_dir)?;
-    fs::create_dir_all(&term_dir)?;
-    // Shells of the normal user and of root both write here.
+    for dir in [&pcap_dir, &term_dir, &session.join("browser"), &session.join("burp")] {
+        fs::create_dir_all(dir)?;
+    }
+    // Shells, browsers and Burp of the normal user and of root all write here.
     fs::set_permissions(&term_dir, fs::Permissions::from_mode(0o1777))?;
     let commands_log = session.join("commands.log");
     fs::write(&commands_log, "# time\tuser@host\tterminal\tcwd\texit\tcommand\n")?;
-    fs::set_permissions(&commands_log, fs::Permissions::from_mode(0o666))?;
+    let tls_keys = session.join("browser").join("tls_keys.log");
+    fs::write(&tls_keys, "")?;
+    for f in [&commands_log, &tls_keys] {
+        fs::set_permissions(f, fs::Permissions::from_mode(0o666))?;
+    }
     chown_recursive(&root, user.uid, user.gid)?;
 
     let mut events = EventLog::open(&session.join("events.log"))?;
@@ -134,8 +166,8 @@ fn run() -> io::Result<()> {
     let marker = root.join(".active_session");
     fs::write(&marker, format!("{}\n{}\n", session.display(), std::process::id()))?;
     fs::set_permissions(&marker, fs::Permissions::from_mode(0o644))?;
-    for rc in install_hooks(&user, &marker)? {
-        events.log(&format!("shell hook installed in {}", rc.display()));
+    for path in install(&user, &marker)? {
+        events.log(&format!("hook installed: {}", path.display()));
     }
 
     let running = Arc::new(AtomicBool::new(true));
@@ -147,7 +179,10 @@ fn run() -> io::Result<()> {
 
     events.log(&format!("session started: challenge={challenge} target={target}"));
     events.log(&format!("session folder: {}", session.display()));
-    println!("\n>>> Open NEW terminals now - every new bash/zsh is recorded. Ctrl+C here to stop.\n");
+    println!("\n>>> Open NEW terminals now - every new bash/zsh is recorded.");
+    println!(">>> (Re)start Firefox/Chrome from the menu or a recorded terminal to log their TLS keys.");
+    println!(">>> Burp: load {BURP_PATH} once (Extensions > Add > Python).");
+    println!(">>> Ctrl+C here to stop.\n");
 
     let target_stem = format!("target_{}", target.to_string().replace(':', "_"));
     let mut caps: BTreeMap<String, Capture> = BTreeMap::new();
@@ -155,7 +190,11 @@ fn run() -> io::Result<()> {
         target_stem.clone(),
         Capture::new("any", &target_stem, vec!["host".into(), target.to_string()]),
     );
+    let homes: Vec<PathBuf> = hooked_homes(&user).into_iter().map(|(h, _, _)| h).collect();
     let mut last_status = Instant::now();
+    let mut last_render = Instant::now();
+    let mut last_history = Instant::now();
+    let mut rendered_size = 0;
 
     while running.load(Ordering::SeqCst) {
         let ifaces = list_interfaces();
@@ -195,6 +234,18 @@ fn run() -> io::Result<()> {
             }
         }
 
+        if last_render.elapsed() >= RENDER_EVERY {
+            last_render = Instant::now();
+            let size = recording_size(&term_dir);
+            if size != rendered_size {
+                rendered_size = size;
+                let _ = transcript::render_session(&session);
+            }
+        }
+        if last_history.elapsed() >= HISTORY_EVERY {
+            last_history = Instant::now();
+            export_browser_history(&session, started_epoch, &homes);
+        }
         if last_status.elapsed() >= STATUS_EVERY {
             last_status = Instant::now();
             print_status(&session, &caps);
@@ -206,8 +257,11 @@ fn run() -> io::Result<()> {
     events.log("stopping...");
     stop_captures(&mut caps);
     let _ = fs::remove_file(&marker);
-    let cleaned = clean_typescripts(&term_dir);
-    events.log(&format!("wrote {cleaned} cleaned terminal transcript(s) (.txt)"));
+    match transcript::render_session(&session) {
+        Ok(n) => events.log(&format!("terminal_output.log: {n} command(s) with their output")),
+        Err(e) => events.log(&format!("could not render terminal transcripts: {e}")),
+    }
+    export_browser_history(&session, started_epoch, &homes);
     let mut info = OpenOptions::new().append(true).open(session.join("session_info.txt"))?;
     writeln!(info, "Stopped:        {}", now_human())?;
     events.log("session stopped");
@@ -216,7 +270,7 @@ fn run() -> io::Result<()> {
     print_status(&session, &caps);
     println!("\nSaved in {}", session.display());
     println!("Terminals still open keep writing their .typescript until closed.");
-    println!("Shell hooks stay installed but are inactive; remove them with: sudo ctf-logger --uninstall");
+    println!("Hooks stay installed but are inactive; remove them with: sudo ctf-logger --uninstall");
     Ok(())
 }
 
@@ -258,11 +312,43 @@ fn stop_captures(caps: &mut BTreeMap<String, Capture>) {
     }
 }
 
+/// Firefox/Chrome history + downloads since the session started -> browser/history.tsv.
+fn export_browser_history(session: &Path, since: f64, homes: &[PathBuf]) {
+    if !which("python3") {
+        return;
+    }
+    let _ = Command::new("python3")
+        .arg(HISTORY_PATH)
+        .arg(since.to_string())
+        .arg(session.join("browser").join("history.tsv"))
+        .args(homes)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Total size of the raw recordings (.typescript + .idx), i.e. not of what we render.
+fn recording_size(term_dir: &Path) -> u64 {
+    fs::read_dir(term_dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "typescript" || x == "idx"))
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn count_lines(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .map(|s| s.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).count())
+        .unwrap_or(0)
+}
+
 fn print_status(session: &Path, caps: &BTreeMap<String, Capture>) {
     let active = caps.values().filter(|c| c.child.is_some()).count();
-    let commands = fs::read_to_string(session.join("commands.log"))
-        .map(|s| s.lines().filter(|l| !l.starts_with('#')).count())
-        .unwrap_or(0);
     let terminals = fs::read_dir(session.join("terminals"))
         .map(|rd| {
             rd.filter_map(Result::ok)
@@ -271,8 +357,13 @@ fn print_status(session: &Path, caps: &BTreeMap<String, Capture>) {
         })
         .unwrap_or(0);
     println!(
-        "[status] tcpdump running: {active} | pcap: {} | terminals: {terminals} | commands: {commands}",
-        human_size(dir_size(&session.join("pcap")))
+        "[status] tcpdump: {active} | pcap: {} | terminals: {terminals} | commands: {} | \
+         browser pages: {} | TLS keys: {} | burp requests: {}",
+        human_size(dir_size(&session.join("pcap"))),
+        count_lines(&session.join("commands.log")),
+        count_lines(&session.join("browser").join("history.tsv")),
+        count_lines(&session.join("browser").join("tls_keys.log")),
+        count_lines(&session.join("burp").join("burp_requests.tsv")),
     );
 }
 
@@ -304,13 +395,23 @@ fn hooked_homes(user: &UserInfo) -> Vec<(PathBuf, u32, u32)> {
     homes
 }
 
-fn install_hooks(user: &UserInfo, marker: &Path) -> io::Result<Vec<PathBuf>> {
+fn write_mode(path: &str, content: &str, mode: u32) -> io::Result<()> {
+    fs::write(path, content)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+/// Install the helper scripts, the shell hooks and the browser launcher overrides.
+/// Returns the rc / launcher files that were changed.
+fn install(user: &UserInfo, marker: &Path) -> io::Result<Vec<PathBuf>> {
+    let marker = marker.to_string_lossy();
     fs::create_dir_all(HOOK_DIR)?;
-    fs::write(HOOK_PATH, HOOK_TEMPLATE.replace("{{MARKER}}", &marker.to_string_lossy()))?;
-    fs::set_permissions(HOOK_PATH, fs::Permissions::from_mode(0o644))?;
+    write_mode(HOOK_PATH, &HOOK_TEMPLATE.replace("{{MARKER}}", &marker), 0o644)?;
+    write_mode(WRAP_PATH, &WRAP_TEMPLATE.replace("{{MARKER}}", &marker), 0o755)?;
+    write_mode(HISTORY_PATH, HISTORY_SCRIPT, 0o644)?;
+    write_mode(BURP_PATH, &BURP_TEMPLATE.replace("{{MARKER}}", &marker), 0o644)?;
 
     let line = format!("[ -r {HOOK_PATH} ] && . {HOOK_PATH}  {RC_MARK}\n");
-    let mut installed = Vec::new();
+    let mut changed = Vec::new();
     for (home, uid, gid) in hooked_homes(user) {
         for rc_name in RC_FILES {
             let rc = home.join(rc_name);
@@ -331,13 +432,47 @@ fn install_hooks(user: &UserInfo, marker: &Path) -> io::Result<Vec<PathBuf>> {
             if !existed {
                 std::os::unix::fs::chown(&rc, Some(uid), Some(gid))?;
             }
-            installed.push(rc);
+            changed.push(rc);
         }
     }
-    Ok(installed)
+    changed.extend(install_browser_launchers(user)?);
+    Ok(changed)
 }
 
-fn uninstall_hooks(user: &UserInfo) -> io::Result<()> {
+/// Copy each installed browser's .desktop file to ~/.local/share/applications (which
+/// takes precedence) with every Exec= line routed through browser-wrap.sh.
+fn install_browser_launchers(user: &UserInfo) -> io::Result<Vec<PathBuf>> {
+    let apps = user.home.join(".local/share/applications");
+    let mut changed = Vec::new();
+    for name in BROWSER_DESKTOP_FILES {
+        let Ok(system) = fs::read_to_string(Path::new("/usr/share/applications").join(name)) else {
+            continue;
+        };
+        let target = apps.join(name);
+        if let Ok(existing) = fs::read_to_string(&target) {
+            if !existing.contains(DESKTOP_MARK) {
+                continue; // the user's own override: leave it alone
+            }
+        }
+        let mut out = String::new();
+        for line in system.lines() {
+            match line.strip_prefix("Exec=") {
+                Some(cmd) if !cmd.starts_with(WRAP_PATH) => out.push_str(&format!("Exec={WRAP_PATH} {cmd}\n")),
+                _ => out.push_str(&format!("{line}\n")),
+            }
+            if line.trim() == "[Desktop Entry]" {
+                out.push_str(&format!("{DESKTOP_MARK}\n"));
+            }
+        }
+        fs::create_dir_all(&apps)?;
+        fs::write(&target, out)?;
+        chown_recursive(&user.home.join(".local/share/applications"), user.uid, user.gid)?;
+        changed.push(target);
+    }
+    Ok(changed)
+}
+
+fn uninstall(user: &UserInfo) -> io::Result<()> {
     for (home, _, _) in hooked_homes(user) {
         for rc_name in RC_FILES {
             let rc = home.join(rc_name);
@@ -354,93 +489,15 @@ fn uninstall_hooks(user: &UserInfo) -> io::Result<()> {
             println!("removed hook from {}", rc.display());
         }
     }
+    let apps = user.home.join(".local/share/applications");
+    for name in BROWSER_DESKTOP_FILES {
+        let path = apps.join(name);
+        if fs::read_to_string(&path).is_ok_and(|c| c.contains(DESKTOP_MARK)) {
+            fs::remove_file(&path)?;
+            println!("removed launcher override {}", path.display());
+        }
+    }
     let _ = fs::remove_dir_all(HOOK_DIR);
-    println!("done");
+    println!("done (unload the CTF-Logger extension in Burp yourself)");
     Ok(())
-}
-
-/// Write a readable `.txt` next to every `.typescript`. Returns how many were written.
-fn clean_typescripts(dir: &Path) -> usize {
-    let Ok(rd) = fs::read_dir(dir) else { return 0 };
-    let mut n = 0;
-    for entry in rd.filter_map(Result::ok) {
-        let path = entry.path();
-        if path.extension().is_some_and(|x| x == "typescript") {
-            if let Ok(raw) = fs::read(&path) {
-                if fs::write(path.with_extension("txt"), strip_terminal_codes(&raw)).is_ok() {
-                    n += 1;
-                }
-            }
-        }
-    }
-    n
-}
-
-/// Remove ANSI/VT escape sequences and apply backspaces/carriage returns, so a raw
-/// terminal recording reads like plain text.
-fn strip_terminal_codes(raw: &[u8]) -> String {
-    let mut out: Vec<u8> = Vec::with_capacity(raw.len());
-    let mut i = 0;
-    while i < raw.len() {
-        let b = raw[i];
-        match b {
-            0x1b => {
-                i += 1;
-                match raw.get(i) {
-                    // CSI: ESC [ params... final byte 0x40..=0x7e
-                    Some(b'[') => {
-                        i += 1;
-                        while i < raw.len() && !(0x40..=0x7e).contains(&raw[i]) {
-                            i += 1;
-                        }
-                    }
-                    // OSC / DCS / etc: terminated by BEL or ESC \
-                    Some(b']') | Some(b'P') | Some(b'^') | Some(b'_') => {
-                        i += 1;
-                        while i < raw.len() {
-                            if raw[i] == 0x07 {
-                                break;
-                            }
-                            if raw[i] == 0x1b && raw.get(i + 1) == Some(&b'\\') {
-                                i += 1;
-                                break;
-                            }
-                            i += 1;
-                        }
-                    }
-                    // charset selection: ESC ( X, ESC ) X ...
-                    Some(b'(') | Some(b')') | Some(b'*') | Some(b'+') => i += 1,
-                    _ => {}
-                }
-            }
-            0x08 => {
-                // backspace: drop the previous character (whole UTF-8 sequence)
-                while let Some(&last) = out.last() {
-                    if last == b'\n' {
-                        break;
-                    }
-                    out.pop();
-                    if last & 0xc0 != 0x80 {
-                        break;
-                    }
-                }
-            }
-            b'\r' => {
-                if raw.get(i + 1) != Some(&b'\n') && raw.get(i + 1) != Some(&b'\r') {
-                    // bare CR: the line is being redrawn, keep only what follows
-                    while let Some(&last) = out.last() {
-                        if last == b'\n' {
-                            break;
-                        }
-                        out.pop();
-                    }
-                }
-            }
-            b'\n' | b'\t' => out.push(b),
-            0x00..=0x1f | 0x7f => {}
-            _ => out.push(b),
-        }
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
