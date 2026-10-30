@@ -109,9 +109,11 @@ root, passwordless sudo is tried first, otherwise you are asked for the sudo pas
 
 - `archives/` - `var_log.tar.gz`, `etc.tar.gz`, `user_artifacts.tar.gz` (shell histories,
   `.ssh`, cron spools, `/tmp`, `/var/tmp`, `/dev/shm`), optional `web_roots.tar.gz`
+- `extracted/` - all archives unpacked, mirroring the victim (`extracted/var/log/auth.log`,
+  `extracted/etc/...`, `extracted/home/...`); rotated `*.gz` logs are also decompressed
 - `logs/` - full journal, kernel and SSH journal, dmesg, auditd reports
 - `users/` - passwd/shadow/sudoers, `last`/`lastb`/`lastlog`, who, all shell histories, authorized_keys
 - `processes/` - process tree, exe/cwd of every PID, open files, systemd units/timers, crontabs, docker
 - `network/` - addresses, routes, listening sockets, connections, firewall rules, hosts/DNS
 - `files/` - SUID/SGID, capabilities, `/tmp` listing, files modified in the last N minutes
-- `summary.txt`, `errors.log`, `MANIFEST.sha256` (hashes of everything), `known_hosts`
+- `summary.txt`, `errors.log`, `MANIFEST.sha256` (hashes of everything as downloaded), `known_hosts`

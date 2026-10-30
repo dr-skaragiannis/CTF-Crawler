@@ -310,14 +310,59 @@ fn collect(ssh: &mut Ssh, out_dir: &Path, minutes: u32, with_web: bool) -> io::R
     }
     writeln!(summary, "\nFinished:   {}", now_human())?;
 
+    // Hash the archives as downloaded, before anything is unpacked.
     write_manifest(out_dir)?;
+    extract_archives(out_dir, &mut errors)?;
     Ok(())
 }
 
-/// SHA-256 of every collected file, for evidence integrity.
+/// Unpack every archive into `extracted/`, which then mirrors the victim's filesystem
+/// (extracted/var/log, extracted/etc, extracted/home/...). Rotated `*.gz` logs are
+/// decompressed next to the originals so every log can be read directly.
+fn extract_archives(out_dir: &Path, errors: &mut File) -> io::Result<()> {
+    let dest = out_dir.join("extracted");
+    fs::create_dir_all(&dest)?;
+    println!("\n[*] extracting archives into {}", dest.display());
+    for entry in fs::read_dir(out_dir.join("archives"))?.filter_map(Result::ok) {
+        let archive = entry.path();
+        if fs::metadata(&archive).map(|m| m.len()).unwrap_or(0) == 0 {
+            continue;
+        }
+        writeln!(errors, "===== extract {} ({}) =====", archive.display(), now_human())?;
+        // The archive comes from the victim: GNU tar strips leading '/' and refuses '..'
+        // members; never restore its owners or device files.
+        let status = Command::new("tar")
+            .args(["-xzf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&dest)
+            .args(["--no-same-owner", "--no-same-permissions", "--exclude=dev/*"])
+            .stdout(Stdio::null())
+            .stderr(errors.try_clone()?)
+            .status()?;
+        let name = archive.file_name().unwrap().to_string_lossy().into_owned();
+        // tar exits non-zero on harmless warnings (sockets, changed files); see errors.log
+        println!("    {name}: {}", if status.success() { "ok" } else { "extracted with warnings (errors.log)" });
+    }
+    let logs = dest.join("var").join("log");
+    if logs.is_dir() {
+        let _ = Command::new("find")
+            .arg(&logs)
+            .args(["-type", "f", "-name", "*.gz", "-exec", "gunzip", "-k", "-f", "{}", "+"])
+            .stderr(errors.try_clone()?)
+            .status();
+        println!("    rotated logs (*.gz) in var/log decompressed");
+    }
+    Ok(())
+}
+
+/// SHA-256 of every collected file (not of the extracted copies), for evidence integrity.
 fn write_manifest(dir: &Path) -> io::Result<()> {
     let out = Command::new("sh")
-        .args(["-c", "find . -type f ! -name MANIFEST.sha256 -exec sha256sum {} + | sort -k2"])
+        .args([
+            "-c",
+            "find . -path ./extracted -prune -o -type f ! -name MANIFEST.sha256 -exec sha256sum {} + | sort -k2",
+        ])
         .current_dir(dir)
         .output()?;
     fs::write(dir.join("MANIFEST.sha256"), out.stdout)
