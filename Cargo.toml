@@ -1,0 +1,13 @@
+[package]
+name = "ctf-logger"
+version = "0.1.0"
+edition = "2021"
+description = "Records attacker-side network traffic and terminal sessions during a CTF, and collects victim logs over SSH"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ctrlc = { version = "3.4", features = ["termination"] }
+libc = "0.2"
+
+[profile.release]
+strip = true
