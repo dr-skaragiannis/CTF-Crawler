@@ -72,6 +72,30 @@ pub fn prompt(label: &str, default: Option<&str>) -> io::Result<String> {
     }
 }
 
+/// Read a line from the terminal without echoing it (for passwords).
+pub fn prompt_password(label: &str) -> io::Result<String> {
+    print!("{label}: ");
+    io::stdout().flush()?;
+    let fd = libc::STDIN_FILENO;
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    let is_tty = unsafe { libc::tcgetattr(fd, &mut saved) } == 0;
+    if is_tty {
+        let mut silent = saved;
+        silent.c_lflag &= !libc::ECHO;
+        silent.c_lflag |= libc::ECHONL;
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &silent) };
+    }
+    let mut line = String::new();
+    let read = io::stdin().read_line(&mut line);
+    if is_tty {
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
+    }
+    if read? == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stdin closed"));
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
 pub fn prompt_ip(label: &str, default: Option<&str>) -> io::Result<IpAddr> {
     loop {
         match prompt(label, default)?.parse() {

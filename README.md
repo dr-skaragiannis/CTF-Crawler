@@ -94,15 +94,17 @@ hooks, the browser launcher overrides and `/etc/ctf-logger` (unload the Burp ext
 
 ## 2. Victim side: `ctf-victim-logs`
 
-Once you have root SSH access on the victim (as root, or a user with passwordless sudo):
+Once you have SSH access to the victim as **root** or as **any user that can sudo**:
 
 ```bash
 ctf-victim-logs
 ```
 
 It asks for the challenge (defaults to the latest one), the victim IP (defaults to the
-target IP of the latest session), SSH user, port and optional key. You enter the password
-once; one SSH master connection is reused for everything. Output goes to
+target IP of the latest session), SSH user, port and optional key. You enter the SSH
+password once; one SSH master connection is reused for everything. If the user is not
+root, passwordless sudo is tried first, otherwise you are asked for the sudo password
+(hidden, 3 tries), which is passed to `sudo -S` for every step. Output goes to
 `CTF-Logs/<challenge>/victim_<ip>_<timestamp>/`:
 
 - `archives/` - `var_log.tar.gz`, `etc.tar.gz`, `user_artifacts.tar.gz` (shell histories,

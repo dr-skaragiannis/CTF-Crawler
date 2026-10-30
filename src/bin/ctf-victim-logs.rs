@@ -1,8 +1,9 @@
 //! ctf-victim-logs - collect the logs and forensic state of the VICTIM VM over SSH.
 //!
-//! Needs root on the victim: either log in as root, or as a user with passwordless sudo.
-//! One SSH master connection is opened (you type the password/passphrase once) and every
-//! collection step reuses it. Output goes to
+//! Needs root on the victim: log in as root, or as any user that can sudo (with or without
+//! a password - the sudo password is asked once and passed to `sudo -S` for every step).
+//! One SSH master connection is opened (you type the SSH password/passphrase once) and
+//! every collection step reuses it. Output goes to
 //!   /home/<user>/CTF-Logs/<challenge>/victim_<ip>_<timestamp>/
 //!     archives/*.tar.gz       /var/log, /etc, user artefacts (histories, .ssh, cron, /tmp...)
 //!     <category>/*.txt        command outputs (journal, processes, network, users, files...)
@@ -14,12 +15,15 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 
 use ctf_logger::{
     chown_recursive, human_size, invoking_user, is_root, log_root, newest_subdir, now_human,
-    prompt, prompt_ip, prompt_yes_no, sanitize, timestamp, which,
+    prompt, prompt_ip, prompt_password, prompt_yes_no, sanitize, timestamp, which,
 };
+
+/// Wrong sudo passwords accepted before giving up.
+const SUDO_TRIES: u32 = 3;
 
 /// (folder, file, remote shell script). Run with `sh -c` as root on the victim.
 const COMMANDS: &[(&str, &str, &str)] = &[
@@ -90,7 +94,17 @@ struct Ssh {
     socket: PathBuf,
     known_hosts: PathBuf,
     identity: Option<String>,
-    sudo: bool,
+    sudo: Sudo,
+}
+
+/// How root is reached on the victim.
+enum Sudo {
+    /// logged in as root
+    None,
+    /// `sudo -n` (NOPASSWD)
+    NoPassword,
+    /// `sudo -S`, the password is written to the remote command's stdin
+    Password(String),
 }
 
 impl Ssh {
@@ -121,26 +135,73 @@ impl Ssh {
 
     fn remote(&self, script: &str) -> String {
         let quoted = format!("'{}'", script.replace('\'', r"'\''"));
-        if self.sudo { format!("sudo -n sh -c {quoted}") } else { format!("sh -c {quoted}") }
+        match self.sudo {
+            Sudo::None => format!("sh -c {quoted}"),
+            Sudo::NoPassword => format!("sudo -n sh -c {quoted}"),
+            // -p '': no prompt text mixed into the output; -k: always read the password,
+            // so a cached sudo ticket can't make it pass the password on to the script
+            Sudo::Password(_) => format!("sudo -S -k -p '' sh -c {quoted}"),
+        }
+    }
+
+    /// Run `script` on the victim as root.
+    fn run(&self, script: &str, stdout: Stdio, stderr: Stdio) -> io::Result<(ExitStatus, Vec<u8>)> {
+        let password = match &self.sudo {
+            Sudo::Password(p) => Some(p),
+            _ => None,
+        };
+        let mut child = self
+            .command()
+            .arg(&self.target)
+            .arg(self.remote(script))
+            .stdin(if password.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()?;
+        if let (Some(password), Some(mut stdin)) = (password, child.stdin.take()) {
+            let _ = writeln!(stdin, "{password}"); // dropping stdin closes it
+        }
+        let out = child.wait_with_output()?;
+        Ok((out.status, out.stdout))
     }
 
     fn output(&self, script: &str) -> io::Result<String> {
-        let out = self.command().arg(&self.target).arg(self.remote(script)).stdin(Stdio::null()).output()?;
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        let (_, stdout) = self.run(script, Stdio::piped(), Stdio::null())?;
+        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
     }
 
     /// Run `script` on the victim, streaming stdout into `out` and stderr into `errors`.
     fn to_file(&self, script: &str, out: &Path, errors: &mut File) -> io::Result<bool> {
         writeln!(errors, "===== {} ({}) =====", out.display(), now_human())?;
-        let status = self
-            .command()
-            .arg(&self.target)
-            .arg(self.remote(script))
-            .stdin(Stdio::null())
-            .stdout(File::create(out)?)
-            .stderr(errors.try_clone()?)
-            .status()?;
+        let (status, _) = self.run(script, File::create(out)?.into(), errors.try_clone()?.into())?;
         Ok(status.success())
+    }
+
+    /// Make sure every step runs as root: directly, via passwordless sudo, or by asking
+    /// for the sudo password.
+    fn become_root(&mut self) -> io::Result<()> {
+        let uid = self.output("id -u")?;
+        if uid == "0" {
+            return Ok(());
+        }
+        self.sudo = Sudo::NoPassword;
+        if self.output("id -u")? == "0" {
+            println!("[*] using passwordless sudo on the victim");
+            return Ok(());
+        }
+        let user = self.target.split('@').next().unwrap_or("user").to_string();
+        for attempt in 1..=SUDO_TRIES {
+            let password = prompt_password(&format!("[sudo] password for {user} on the victim"))?;
+            self.sudo = Sudo::Password(password);
+            if self.output("id -u")? == "0" {
+                println!("[*] using sudo on the victim");
+                return Ok(());
+            }
+            eprintln!("    sudo refused ({attempt}/{SUDO_TRIES}): wrong password, or {user} may not use sudo");
+        }
+        Err(io::Error::other(format!(
+            "could not become root as {user} (uid={uid}); log in as root or use a user in the sudo group"
+        )))
     }
 }
 
@@ -165,9 +226,9 @@ fn run() -> io::Result<()> {
     let challenge = sanitize(&prompt("Challenge name", default_name.as_deref())?);
     let default_ip = target_ip_of(&root.join(&challenge));
     let ip = prompt_ip("Victim IP address", default_ip.as_deref())?;
-    let ssh_user = prompt("SSH user (root, or a user with passwordless sudo)", Some("root"))?;
+    let ssh_user = prompt("SSH user (root, or a user that can sudo)", Some("root"))?;
     let port = prompt("SSH port", Some("22"))?;
-    let identity = prompt("SSH private key file (empty = password)", Some("-"))?;
+    let identity = prompt("SSH private key file (- = log in with password)", Some("-"))?;
     let minutes = prompt("List files modified in the last N minutes", Some("240"))?
         .parse::<u32>()
         .unwrap_or(240);
@@ -184,7 +245,7 @@ fn run() -> io::Result<()> {
         socket: std::env::temp_dir().join(format!("ctf-ssh-{}.sock", std::process::id())),
         known_hosts: out_dir.join("known_hosts"),
         identity: (identity != "-").then_some(identity),
-        sudo: false,
+        sudo: Sudo::None,
     };
 
     println!("\n[*] connecting to {} ...", ssh.target);
@@ -201,24 +262,19 @@ fn run() -> io::Result<()> {
 }
 
 fn collect(ssh: &mut Ssh, out_dir: &Path, minutes: u32, with_web: bool) -> io::Result<()> {
-    let uid = ssh.output("id -u")?;
-    if uid != "0" {
-        ssh.sudo = true;
-        if ssh.output("id -u")? != "0" {
-            return Err(io::Error::other(format!(
-                "{} is not root and has no passwordless sudo (uid={uid}); log in as root",
-                ssh.target
-            )));
-        }
-        println!("[*] using sudo on the victim");
-    }
+    ssh.become_root()?;
     let hostname = ssh.output("uname -n")?;
     println!("[*] root on {hostname} - collecting\n");
 
     let mut errors = OpenOptions::new().create(true).append(true).open(out_dir.join("errors.log"))?;
     let mut summary = File::create(out_dir.join("summary.txt"))?;
     writeln!(summary, "Victim:     {} ({hostname})", ssh.target)?;
-    writeln!(summary, "Sudo used:  {}", ssh.sudo)?;
+    let via = match ssh.sudo {
+        Sudo::None => "root login",
+        Sudo::NoPassword => "sudo (no password)",
+        Sudo::Password(_) => "sudo (password)",
+    };
+    writeln!(summary, "Root via:   {via}")?;
     writeln!(summary, "Started:    {}\n", now_human())?;
 
     let recent = format!(
