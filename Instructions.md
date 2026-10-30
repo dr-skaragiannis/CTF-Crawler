@@ -3,7 +3,23 @@
 Σύντομος οδηγός για το στήσιμο και τη χρήση των δύο εργαλείων σε ένα CTF εργαστήριο
 (δικά σου ή εγκεκριμένα μηχανήματα).
 
-## 1. Εγκατάσταση στο Kali (επιτιθέμενος)
+## 1. Λήψη του κώδικα
+
+Κατέβασε το repository και μπες στον φάκελό του:
+
+```bash
+git clone https://github.com/dr-skaragiannis/CTF-Crawler.git
+```
+
+```bash
+cd CTF-Crawler
+```
+
+```bash
+cat README.md
+```
+
+## 2. Εγκατάσταση στο Kali (επιτιθέμενος)
 
 ```bash
 sudo apt install -y cargo tcpdump bsdutils openssh-client
@@ -17,7 +33,7 @@ cargo build --release
 sudo install -m 755 target/release/ctf-logger target/release/ctf-victim-logs /usr/local/bin/
 ```
 
-## 2. Καταγραφή από τον επιτιθέμενο — `ctf-logger`
+## 3. Καταγραφή από τον επιτιθέμενο — `ctf-logger`
 
 Γίνε root και ξεκίνα την καταγραφή:
 
@@ -34,7 +50,7 @@ ctf-logger
 TLS και ιστορικό browser, κίνηση του Burp) μέχρι να πατήσεις **Ctrl+C**. Τα αρχεία
 αποθηκεύονται στο `/home/<χρήστης>/CTF-Logs/<challenge>/<ημερομηνία_ώρα>/`.
 
-## 3. Προετοιμασία του θύματος (victim VM)
+## 4. Προετοιμασία του θύματος (victim VM)
 
 Αφού αποκτήσεις πρόσβαση root στο μηχάνημα-θύμα, δημιούργησε έναν νέο χρήστη και δώσ'
 του δικαιώματα sudo. Έτσι το `ctf-victim-logs` συνδέεται με αυτόν τον χρήστη αντί για
@@ -58,7 +74,7 @@ passwd <username>
 usermod -aG sudo <username>
 ```
 
-## 4. Συλλογή logs από το θύμα — `ctf-victim-logs`
+## 5. Συλλογή logs από το θύμα — `ctf-victim-logs`
 
 Στη συνέχεια, από το **Kali**, τρέξε την παρακάτω εντολή. Ανοίγει σύνδεση SSH και,
 χρησιμοποιώντας τον νέο χρήστη, κατεβάζει όλα τα logs από το victim VM:
